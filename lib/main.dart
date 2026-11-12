@@ -9,13 +9,14 @@ import 'package:image_picker/image_picker.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Currency shown on the receipt amount.
 const String kCurrency = 'RM';
 
 /// Global store for saved business profiles.
-final ProfileStore store = ProfileStore();
+final AppStore store = AppStore();
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -58,6 +59,10 @@ class ReceiptApp extends StatelessWidget {
           backgroundColor: AppColors.teal,
           foregroundColor: Colors.white,
         ),
+        navigationBarTheme: NavigationBarThemeData(
+          backgroundColor: Colors.white,
+          indicatorColor: AppColors.gold,
+        ),
         textTheme: ThemeData.light().textTheme.apply(
               bodyColor: AppColors.text,
               displayColor: AppColors.text,
@@ -79,7 +84,7 @@ class ReceiptApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const ReceiptFormPage(),
+      home: const HomePage(),
     );
   }
 }
@@ -240,10 +245,66 @@ class ReceiptData {
 }
 
 // ===========================================================================
-// STORAGE (shared_preferences)
+// CUSTOMERS + STORAGE (shared_preferences)
 // ===========================================================================
-class ProfileStore extends ChangeNotifier {
+class Customer {
+  final String id;
+  final String businessId;
+  String name;
+  String phone;
+  String package;
+  double amount;
+  String payment;
+  int nights; // usual stay length, used to pre-fill the stay dates
+  String note;
+  String? lastReceiptAt; // ISO-8601
+
+  Customer({
+    required this.id,
+    required this.businessId,
+    required this.name,
+    this.phone = '',
+    this.package = '',
+    this.amount = 0,
+    this.payment = 'Deposit',
+    this.nights = 1,
+    this.note = '',
+    this.lastReceiptAt,
+  });
+
+  DateTime? get lastReceipt =>
+      lastReceiptAt == null ? null : DateTime.tryParse(lastReceiptAt!);
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'businessId': businessId,
+        'name': name,
+        'phone': phone,
+        'package': package,
+        'amount': amount,
+        'payment': payment,
+        'nights': nights,
+        'note': note,
+        'lastReceiptAt': lastReceiptAt,
+      };
+
+  factory Customer.fromJson(Map<String, dynamic> j) => Customer(
+        id: j['id'] as String,
+        businessId: j['businessId'] as String,
+        name: (j['name'] ?? '') as String,
+        phone: (j['phone'] ?? '') as String,
+        package: (j['package'] ?? '') as String,
+        amount: ((j['amount'] ?? 0) as num).toDouble(),
+        payment: (j['payment'] ?? 'Deposit') as String,
+        nights: (j['nights'] ?? 1) as int,
+        note: (j['note'] ?? '') as String,
+        lastReceiptAt: j['lastReceiptAt'] as String?,
+      );
+}
+
+class AppStore extends ChangeNotifier {
   List<BusinessProfile> profiles = [];
+  List<Customer> customers = [];
   String? selectedId;
   SharedPreferences? _prefs;
 
@@ -252,6 +313,12 @@ class ProfileStore extends ChangeNotifier {
       if (p.id == selectedId) return p;
     }
     return profiles.isEmpty ? null : profiles.first;
+  }
+
+  List<Customer> customersFor(String businessId) {
+    final list = customers.where((c) => c.businessId == businessId).toList();
+    list.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return list;
   }
 
   Future<void> load() async {
@@ -268,6 +335,16 @@ class ProfileStore extends ChangeNotifier {
         profiles = [];
       }
     }
+    final rawC = _prefs!.getString('customers');
+    if (rawC != null) {
+      try {
+        customers = (jsonDecode(rawC) as List)
+            .map((e) => Customer.fromJson(e as Map<String, dynamic>))
+            .toList();
+      } catch (_) {
+        customers = [];
+      }
+    }
     selectedId = _prefs!.getString('selectedId');
     if (raw == null) await save();
   }
@@ -275,25 +352,29 @@ class ProfileStore extends ChangeNotifier {
   Future<void> save() async {
     await _prefs?.setString(
         'profiles', jsonEncode(profiles.map((p) => p.toJson()).toList()));
+    await _prefs?.setString(
+        'customers', jsonEncode(customers.map((c) => c.toJson()).toList()));
     if (selectedId != null) {
       await _prefs?.setString('selectedId', selectedId!);
     }
     notifyListeners();
   }
 
+  // --- businesses ---------------------------------------------------------
   Future<void> upsert(BusinessProfile p) async {
     final i = profiles.indexWhere((e) => e.id == p.id);
     if (i >= 0) {
       profiles[i] = p;
     } else {
       profiles.add(p);
-      selectedId = p.id;
+      selectedId = p.id; // newly added business becomes the active one
     }
     await save();
   }
 
   Future<void> remove(String id) async {
     profiles.removeWhere((p) => p.id == id);
+    customers.removeWhere((c) => c.businessId == id);
     if (selectedId == id) {
       selectedId = profiles.isEmpty ? null : profiles.first.id;
     }
@@ -304,30 +385,232 @@ class ProfileStore extends ChangeNotifier {
     selectedId = id;
     await save();
   }
+
+  // --- customers ----------------------------------------------------------
+  Future<void> upsertCustomer(Customer c) async {
+    final i = customers.indexWhere((e) => e.id == c.id);
+    if (i >= 0) {
+      customers[i] = c;
+    } else {
+      customers.add(c);
+    }
+    await save();
+  }
+
+  Future<void> removeCustomer(String id) async {
+    customers.removeWhere((c) => c.id == id);
+    await save();
+  }
+
+  // --- receipt numbers ------------------------------------------------------
+  /// Issues the next receipt number (sequential increments the saved counter).
+  Future<String> issueReceiptNo(BusinessProfile p) async {
+    if (p.randomNumbering) {
+      return '${p.prefix}${100000 + Random().nextInt(900000)}';
+    }
+    final no = '${p.prefix}${p.nextNumber}';
+    p.nextNumber += 1;
+    await save();
+    return no;
+  }
 }
 
 // ===========================================================================
-// PAGE 1: FORM
+// HOME (tabs) + SHARED WIDGETS
 // ===========================================================================
-class ReceiptFormPage extends StatefulWidget {
-  const ReceiptFormPage({super.key});
+const kPaymentOptions = ['Deposit', 'Bayaran Penuh', 'Baki'];
+const _addBusinessValue = '__add_business__';
+
+/// Days + nights label, e.g. 21 -> 22 Nov = "2H1M" (2 hari 1 malam).
+String durationLabel(DateTimeRange r) {
+  final nights = r.end.difference(r.start).inDays;
+  return '${nights + 1}H${nights}M';
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
 
   @override
-  State<ReceiptFormPage> createState() => _ReceiptFormPageState();
+  State<HomePage> createState() => _HomePageState();
 }
 
-class _ReceiptFormPageState extends State<ReceiptFormPage> {
+class _HomePageState extends State<HomePage> {
+  int _tab = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: store,
+      builder: (context, _) {
+        final p = store.selected;
+        return Scaffold(
+          appBar: AppBar(
+            title: Text(_tab == 0 ? 'New receipt' : 'Customers'),
+            actions: [
+              IconButton(
+                tooltip: 'Manage businesses',
+                icon: const Icon(Icons.storefront),
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const ProfilesPage()),
+                ),
+              ),
+            ],
+          ),
+          body: p == null
+              ? const _EmptyBusiness()
+              : IndexedStack(
+                  index: _tab,
+                  children: [
+                    ReceiptFormTab(business: p),
+                    CustomersTab(business: p),
+                  ],
+                ),
+          bottomNavigationBar: p == null
+              ? null
+              : NavigationBar(
+                  selectedIndex: _tab,
+                  onDestinationSelected: (i) => setState(() => _tab = i),
+                  destinations: const [
+                    NavigationDestination(
+                      icon: Icon(Icons.receipt_long_outlined),
+                      selectedIcon: Icon(Icons.receipt_long),
+                      label: 'New receipt',
+                    ),
+                    NavigationDestination(
+                      icon: Icon(Icons.people_outline),
+                      selectedIcon: Icon(Icons.people),
+                      label: 'Customers',
+                    ),
+                  ],
+                ),
+        );
+      },
+    );
+  }
+}
+
+class _EmptyBusiness extends StatelessWidget {
+  const _EmptyBusiness();
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.storefront, size: 56, color: AppColors.teal),
+            const SizedBox(height: 12),
+            const Text('Add your business details first.'),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ProfileEditorPage()),
+              ),
+              icon: const Icon(Icons.add),
+              label: const Text('Add business'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Business dropdown: pick an existing business or add a new one.
+class BusinessSelector extends StatelessWidget {
+  final BusinessProfile current;
+  const BusinessSelector({super.key, required this.current});
+
+  @override
+  Widget build(BuildContext context) {
+    return InputDecorator(
+      decoration: const InputDecoration(labelText: 'Issue receipt as'),
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          isExpanded: true,
+          isDense: true,
+          value: current.id,
+          items: [
+            for (final b in store.profiles)
+              DropdownMenuItem(
+                value: b.id,
+                child: Text(b.name, overflow: TextOverflow.ellipsis),
+              ),
+            const DropdownMenuItem(
+              value: _addBusinessValue,
+              child: Row(
+                children: [
+                  Icon(Icons.add_circle_outline,
+                      size: 18, color: AppColors.teal),
+                  SizedBox(width: 8),
+                  Text(
+                    'Add new business',
+                    style: TextStyle(
+                        color: AppColors.teal, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+            ),
+          ],
+          onChanged: (v) {
+            if (v == null) return;
+            if (v == _addBusinessValue) {
+              // The new business is selected automatically after saving.
+              Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ProfileEditorPage()),
+              );
+            } else if (v != current.id) {
+              store.select(v);
+            }
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _PaymentChips extends StatelessWidget {
+  final TextEditingController controller;
+  const _PaymentChips(this.controller);
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      children: [
+        for (final o in kPaymentOptions)
+          ActionChip(label: Text(o), onPressed: () => controller.text = o),
+      ],
+    );
+  }
+}
+
+// ===========================================================================
+// TAB 1: NEW RECEIPT FORM
+// ===========================================================================
+class ReceiptFormTab extends StatefulWidget {
+  final BusinessProfile business;
+  const ReceiptFormTab({super.key, required this.business});
+
+  @override
+  State<ReceiptFormTab> createState() => _ReceiptFormTabState();
+}
+
+class _ReceiptFormTabState extends State<ReceiptFormTab> {
   final _formKey = GlobalKey<FormState>();
   final _customer = TextEditingController();
   final _duration = TextEditingController();
   final _package = TextEditingController();
   final _amount = TextEditingController();
   final _payment = TextEditingController(text: 'Deposit');
-  static const _paymentOptions = ['Deposit', 'Bayaran Penuh', 'Baki'];
 
   DateTimeRange? _stay;
+  bool _saveCustomer = false;
 
   // Receipt number handling
+  String? _numberFor; // business the numbers below belong to
   String? _issuedNo; // locked once the receipt has been generated
   String? _randomNo; // preview for random mode
 
@@ -348,11 +631,6 @@ class _ReceiptFormPageState extends State<ReceiptFormPage> {
     return '${p.prefix}${p.nextNumber}';
   }
 
-  String _durationLabel(DateTimeRange r) {
-    final nights = r.end.difference(r.start).inDays;
-    return '${nights + 1}H${nights}M'; // e.g. 2H1M = 2 hari 1 malam
-  }
-
   Future<void> _pickStay() async {
     final r = await showDateRangePicker(
       context: context,
@@ -363,7 +641,7 @@ class _ReceiptFormPageState extends State<ReceiptFormPage> {
     if (r != null) {
       setState(() {
         _stay = r;
-        _duration.text = _durationLabel(r);
+        _duration.text = durationLabel(r);
       });
     }
   }
@@ -393,6 +671,28 @@ class _ReceiptFormPageState extends State<ReceiptFormPage> {
       payment: _payment.text.trim(),
     );
 
+    // Optionally remember this person as a recurring customer.
+    if (_saveCustomer) {
+      final nights = _stay!.end.difference(_stay!.start).inDays;
+      final existing = store.customers
+          .where((c) =>
+              c.businessId == p.id &&
+              c.name.toLowerCase() == data.customer.toLowerCase())
+          .firstOrNull;
+      final c = existing ??
+          Customer(
+            id: DateTime.now().microsecondsSinceEpoch.toString(),
+            businessId: p.id,
+            name: data.customer,
+          );
+      c.package = data.package;
+      c.amount = data.amount;
+      c.payment = data.payment;
+      c.nights = nights < 1 ? 1 : nights;
+      c.lastReceiptAt = data.issuedAt.toIso8601String();
+      await store.upsertCustomer(c);
+    }
+
     if (!mounted) return;
     final startNew = await Navigator.of(context).push<bool>(
       MaterialPageRoute(builder: (_) => ReceiptPage(data: data)),
@@ -408,6 +708,7 @@ class _ReceiptFormPageState extends State<ReceiptFormPage> {
       _amount.clear();
       _payment.text = 'Deposit';
       _stay = null;
+      _saveCustomer = false;
       _issuedNo = null;
       _randomNo = null;
     });
@@ -426,75 +727,21 @@ class _ReceiptFormPageState extends State<ReceiptFormPage> {
 
   @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(
-      listenable: store,
-      builder: (context, _) {
-        final p = store.selected;
-        return Scaffold(
-          appBar: AppBar(
-            title: const Text('Receipt Generator'),
-            actions: [
-              IconButton(
-                tooltip: 'Manage businesses',
-                icon: const Icon(Icons.storefront),
-                onPressed: () => Navigator.of(context).push(
-                  MaterialPageRoute(builder: (_) => const ProfilesPage()),
-                ),
-              ),
-            ],
-          ),
-          body: p == null ? _emptyState() : _form(p),
-        );
-      },
-    );
-  }
+    final p = widget.business;
 
-  Widget _emptyState() => Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.storefront, size: 56, color: AppColors.teal),
-              const SizedBox(height: 12),
-              const Text('Add your business details first.'),
-              const SizedBox(height: 12),
-              FilledButton.icon(
-                onPressed: () => Navigator.of(context).push(
-                  MaterialPageRoute(
-                      builder: (_) => const ProfileEditorPage()),
-                ),
-                icon: const Icon(Icons.add),
-                label: const Text('Add business'),
-              ),
-            ],
-          ),
-        ),
-      );
+    // Switching business starts a fresh receipt number preview.
+    if (_numberFor != p.id) {
+      _numberFor = p.id;
+      _issuedNo = null;
+      _randomNo = null;
+    }
 
-  Widget _form(BusinessProfile p) {
     return Form(
       key: _formKey,
       child: ListView(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 32),
         children: [
-          _section('Business'),
-          DropdownButtonFormField<String>(
-            key: ValueKey(p.id),
-            initialValue: p.id,
-            decoration: const InputDecoration(labelText: 'Issue receipt as'),
-            items: store.profiles
-                .map((b) => DropdownMenuItem(value: b.id, child: Text(b.name)))
-                .toList(),
-            onChanged: (id) {
-              if (id == null) return;
-              setState(() {
-                _issuedNo = null;
-                _randomNo = null;
-              });
-              store.select(id);
-            },
-          ),
+          BusinessSelector(current: p),
           const SizedBox(height: 10),
 
           // Auto fields (read-only)
@@ -580,18 +827,20 @@ class _ReceiptFormPageState extends State<ReceiptFormPage> {
             validator: _req,
           ),
           const SizedBox(height: 6),
-          Wrap(
-            spacing: 8,
-            children: [
-              for (final o in _paymentOptions)
-                ActionChip(
-                  label: Text(o),
-                  onPressed: () => setState(() => _payment.text = o),
-                ),
-            ],
+          _PaymentChips(_payment),
+
+          const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            value: _saveCustomer,
+            onChanged: (v) => setState(() => _saveCustomer = v),
+            activeThumbColor: AppColors.teal,
+            title: const Text('Save to customer list'),
+            subtitle: const Text(
+                'For recurring customers. Next time, generate in one tap.'),
           ),
 
-          const SizedBox(height: 24),
+          const SizedBox(height: 16),
           FilledButton.icon(
             onPressed: () => _submit(p),
             icon: const Icon(Icons.receipt_long),
@@ -626,9 +875,29 @@ class _ReceiptFormPageState extends State<ReceiptFormPage> {
 // ===========================================================================
 // PAGE 2: RECEIPT + EXPORT
 // ===========================================================================
+String _two(int n) => n.toString().padLeft(2, '0');
+
+/// 2026-11-12
+String isoDate(DateTime d) => '${d.year}-${_two(d.month)}-${_two(d.day)}';
+
+/// File name without extension: customer name + issue date,
+/// e.g. "SANIZAH_BT_SANIP_2026-11-12".
+String receiptFileBase(ReceiptData d) {
+  final name = d.customer
+      .trim()
+      .replaceAll(RegExp(r'[^\p{L}\p{N}]+', unicode: true), '_')
+      .replaceAll(RegExp(r'^_+|_+$'), '');
+  return '${name.isEmpty ? 'receipt' : name}_${isoDate(d.issuedAt)}';
+}
+
 class ReceiptPage extends StatefulWidget {
   final ReceiptData data;
-  const ReceiptPage({super.key, required this.data});
+
+  /// true  -> opened from the form (shows Edit details / New receipt)
+  /// false -> opened from the customer list (shows Back)
+  final bool fromForm;
+
+  const ReceiptPage({super.key, required this.data, this.fromForm = true});
 
   @override
   State<ReceiptPage> createState() => _ReceiptPageState();
@@ -637,11 +906,7 @@ class ReceiptPage extends StatefulWidget {
 class _ReceiptPageState extends State<ReceiptPage> {
   final GlobalKey _boundaryKey = GlobalKey();
 
-  String get _fileName {
-    final safe =
-        widget.data.receiptNo.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-    return 'receipt_$safe.pdf';
-  }
+  String get _base => receiptFileBase(widget.data);
 
   /// Renders exactly what is on screen to a high-resolution PNG.
   Future<Uint8List> _capturePng() async {
@@ -671,9 +936,24 @@ class _ReceiptPageState extends State<ReceiptPage> {
     return doc.save();
   }
 
-  Future<void> _export() async {
+  Future<void> _exportPdf() async {
     try {
-      await Printing.sharePdf(bytes: await _buildPdf(), filename: _fileName);
+      await Printing.sharePdf(bytes: await _buildPdf(), filename: '$_base.pdf');
+    } catch (e) {
+      _toast('Export failed: $e');
+    }
+  }
+
+  Future<void> _exportImage() async {
+    try {
+      final png = await _capturePng();
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile.fromData(png, mimeType: 'image/png')],
+          fileNameOverrides: ['$_base.png'],
+          title: _base,
+        ),
+      );
     } catch (e) {
       _toast('Export failed: $e');
     }
@@ -683,7 +963,7 @@ class _ReceiptPageState extends State<ReceiptPage> {
     try {
       await Printing.layoutPdf(
         onLayout: (_) => _buildPdf(),
-        name: _fileName,
+        name: '$_base.pdf',
       );
     } catch (e) {
       _toast('Print failed: $e');
@@ -722,32 +1002,49 @@ class _ReceiptPageState extends State<ReceiptPage> {
                     ),
                   ),
                 ),
-                const SizedBox(height: 20),
+                const SizedBox(height: 12),
+                Text(
+                  'File name: $_base',
+                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+                const SizedBox(height: 12),
                 Wrap(
                   spacing: 10,
                   runSpacing: 10,
                   alignment: WrapAlignment.center,
                   children: [
                     FilledButton.icon(
-                      onPressed: _export,
+                      onPressed: _exportPdf,
                       icon: const Icon(Icons.picture_as_pdf),
                       label: const Text('Export PDF'),
+                    ),
+                    FilledButton.icon(
+                      onPressed: _exportImage,
+                      icon: const Icon(Icons.image),
+                      label: const Text('Export Image'),
                     ),
                     OutlinedButton.icon(
                       onPressed: _preview,
                       icon: const Icon(Icons.print),
                       label: const Text('Print / Preview'),
                     ),
-                    TextButton.icon(
-                      onPressed: () => Navigator.of(context).pop(false),
-                      icon: const Icon(Icons.edit),
-                      label: const Text('Edit details'),
-                    ),
-                    TextButton.icon(
-                      onPressed: () => Navigator.of(context).pop(true),
-                      icon: const Icon(Icons.add),
-                      label: const Text('New receipt'),
-                    ),
+                    if (widget.fromForm) ...[
+                      TextButton.icon(
+                        onPressed: () => Navigator.of(context).pop(false),
+                        icon: const Icon(Icons.edit),
+                        label: const Text('Edit details'),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => Navigator.of(context).pop(true),
+                        icon: const Icon(Icons.add),
+                        label: const Text('New receipt'),
+                      ),
+                    ] else
+                      TextButton.icon(
+                        onPressed: () => Navigator.of(context).pop(false),
+                        icon: const Icon(Icons.arrow_back),
+                        label: const Text('Back to customers'),
+                      ),
                   ],
                 ),
               ],
@@ -1252,6 +1549,588 @@ class _Logo extends StatelessWidget {
 }
 
 // ===========================================================================
+// TAB 2: CUSTOMER LIST (recurring customers -> one-tap receipts)
+// ===========================================================================
+class CustomersTab extends StatefulWidget {
+  final BusinessProfile business;
+  const CustomersTab({super.key, required this.business});
+
+  @override
+  State<CustomersTab> createState() => _CustomersTabState();
+}
+
+class _CustomersTabState extends State<CustomersTab> {
+  final _search = TextEditingController();
+  String _q = '';
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  void _openEditor([Customer? c]) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) =>
+            CustomerEditorPage(business: widget.business, customer: c),
+      ),
+    );
+  }
+
+  Future<void> _confirmDelete(Customer c) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete customer?'),
+        content: Text('"${c.name}" will be removed from the list.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok == true) await store.removeCustomer(c.id);
+  }
+
+  /// Auto-generate a receipt from the saved customer details.
+  Future<void> _generate(Customer c) async {
+    final r = await showModalBottomSheet<_QuickResult>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      backgroundColor: AppColors.background,
+      builder: (_) => _QuickGenerateSheet(customer: c),
+    );
+    if (r == null || !mounted) return;
+
+    final b = widget.business;
+    final no = await store.issueReceiptNo(b); // auto receipt number
+    final now = DateTime.now(); // auto date
+    c.lastReceiptAt = now.toIso8601String();
+    await store.upsertCustomer(c);
+    if (!mounted) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ReceiptPage(
+          fromForm: false,
+          data: ReceiptData(
+            business: b,
+            receiptNo: no,
+            issuedAt: now,
+            customer: c.name,
+            stayStart: r.stay.start,
+            stayEnd: r.stay.end,
+            duration: r.duration,
+            package: r.package,
+            amount: r.amount,
+            payment: r.payment,
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final all = store.customersFor(widget.business.id);
+    final list = _q.isEmpty
+        ? all
+        : all
+            .where((c) => c.name.toLowerCase().contains(_q.toLowerCase()))
+            .toList();
+
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      floatingActionButton: FloatingActionButton.extended(
+        backgroundColor: AppColors.teal,
+        foregroundColor: Colors.white,
+        onPressed: () => _openEditor(),
+        icon: const Icon(Icons.person_add),
+        label: const Text('Add customer'),
+      ),
+      body: ListView(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
+        children: [
+          BusinessSelector(current: widget.business),
+          const SizedBox(height: 10),
+          if (all.isNotEmpty)
+            TextField(
+              controller: _search,
+              decoration: const InputDecoration(
+                prefixIcon: Icon(Icons.search),
+                hintText: 'Search customers',
+              ),
+              onChanged: (v) => setState(() => _q = v.trim()),
+            ),
+          const SizedBox(height: 10),
+          if (all.isEmpty)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 40, horizontal: 16),
+              child: Column(
+                children: [
+                  Icon(Icons.people_outline, size: 56, color: AppColors.teal),
+                  SizedBox(height: 12),
+                  Text(
+                    'No customers yet for this business.\n'
+                    'Tap "Add customer", or switch on "Save to customer list" '
+                    'when generating a receipt.',
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ),
+            )
+          else if (list.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(child: Text('No customer matches your search.')),
+            )
+          else
+            for (final c in list) _card(c),
+        ],
+      ),
+    );
+  }
+
+  Widget _card(Customer c) {
+    final summary = [
+      if (c.package.isNotEmpty) c.package,
+      '$kCurrency ${c.amount.toStringAsFixed(2)}',
+      c.payment,
+    ].join('  •  ');
+
+    return Card(
+      color: Colors.white,
+      margin: const EdgeInsets.only(bottom: 10),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  backgroundColor: widget.business.color,
+                  child: Text(
+                    c.name.isEmpty ? '?' : c.name[0].toUpperCase(),
+                    style: const TextStyle(color: Colors.white),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(c.name,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 16)),
+                      if (c.phone.isNotEmpty)
+                        Text(c.phone, style: const TextStyle(fontSize: 12)),
+                    ],
+                  ),
+                ),
+                PopupMenuButton<String>(
+                  onSelected: (v) {
+                    if (v == 'edit') _openEditor(c);
+                    if (v == 'delete') _confirmDelete(c);
+                  },
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: 'edit', child: Text('Edit')),
+                    PopupMenuItem(value: 'delete', child: Text('Delete')),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(summary),
+            if (c.note.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(
+                  c.note,
+                  style: const TextStyle(
+                      fontSize: 12,
+                      fontStyle: FontStyle.italic,
+                      color: Colors.black54),
+                ),
+              ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    c.lastReceipt == null
+                        ? 'No receipt yet'
+                        : 'Last receipt: ${fmtDate(c.lastReceipt!)}',
+                    style:
+                        const TextStyle(fontSize: 12, color: Colors.black54),
+                  ),
+                ),
+                FilledButton.icon(
+                  onPressed: () => _generate(c),
+                  icon: const Icon(Icons.receipt_long, size: 18),
+                  label: const Text('Generate receipt'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Quick generate: pre-filled from the customer, just confirm the dates.
+// ---------------------------------------------------------------------------
+class _QuickResult {
+  final DateTimeRange stay;
+  final String duration;
+  final String package;
+  final double amount;
+  final String payment;
+  const _QuickResult({
+    required this.stay,
+    required this.duration,
+    required this.package,
+    required this.amount,
+    required this.payment,
+  });
+}
+
+class _QuickGenerateSheet extends StatefulWidget {
+  final Customer customer;
+  const _QuickGenerateSheet({required this.customer});
+
+  @override
+  State<_QuickGenerateSheet> createState() => _QuickGenerateSheetState();
+}
+
+class _QuickGenerateSheetState extends State<_QuickGenerateSheet> {
+  final _key = GlobalKey<FormState>();
+  late DateTimeRange _stay;
+  late final TextEditingController _duration;
+  late final TextEditingController _package;
+  late final TextEditingController _amount;
+  late final TextEditingController _payment;
+
+  @override
+  void initState() {
+    super.initState();
+    final c = widget.customer;
+    final now = DateTime.now();
+    final start = DateTime(now.year, now.month, now.day);
+    _stay = DateTimeRange(
+      start: start,
+      end: start.add(Duration(days: c.nights < 0 ? 0 : c.nights)),
+    );
+    _duration = TextEditingController(text: durationLabel(_stay));
+    _package = TextEditingController(text: c.package);
+    _amount = TextEditingController(text: c.amount.toStringAsFixed(2));
+    _payment = TextEditingController(text: c.payment);
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_duration, _package, _amount, _payment]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _pick() async {
+    final r = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+      initialDateRange: _stay,
+    );
+    if (r != null) {
+      setState(() {
+        _stay = r;
+        _duration.text = durationLabel(r);
+      });
+    }
+  }
+
+  void _confirm() {
+    if (!_key.currentState!.validate()) return;
+    Navigator.pop(
+      context,
+      _QuickResult(
+        stay: _stay,
+        duration: _duration.text.trim(),
+        package: _package.text.trim(),
+        amount: double.parse(_amount.text.trim()),
+        payment: _payment.text.trim(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+          16, 0, 16, 16 + MediaQuery.of(context).viewInsets.bottom),
+      child: SingleChildScrollView(
+        child: Form(
+          key: _key,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Receipt for ${widget.customer.name}',
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Receipt no. and date are generated automatically. '
+                'Check the stay dates, then generate.',
+                style: TextStyle(fontSize: 12),
+              ),
+              const SizedBox(height: 14),
+              InkWell(
+                onTap: _pick,
+                child: InputDecorator(
+                  decoration: const InputDecoration(
+                    labelText: 'Stay dates (Tarikh)',
+                    suffixIcon: Icon(Icons.date_range, size: 20),
+                  ),
+                  child: Text(_sameDay(_stay.start, _stay.end)
+                      ? fmtDate(_stay.start)
+                      : '${fmtDate(_stay.start)} - ${fmtDate(_stay.end)}'),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: TextFormField(
+                      controller: _package,
+                      decoration:
+                          const InputDecoration(labelText: 'Package (Pakej)'),
+                      validator: _req,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: TextFormField(
+                      controller: _duration,
+                      decoration: const InputDecoration(
+                          labelText: 'Stay (Penginapan)'),
+                      validator: _req,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: _amount,
+                decoration: const InputDecoration(
+                  labelText: 'Amount (Jumlah)',
+                  prefixText: '$kCurrency ',
+                ),
+                keyboardType:
+                    const TextInputType.numberWithOptions(decimal: true),
+                validator: _amountValidator,
+              ),
+              const SizedBox(height: 10),
+              TextFormField(
+                controller: _payment,
+                decoration:
+                    const InputDecoration(labelText: 'Payment (Bayaran)'),
+                validator: _req,
+              ),
+              const SizedBox(height: 6),
+              _PaymentChips(_payment),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  onPressed: _confirm,
+                  icon: const Icon(Icons.receipt_long),
+                  label: const Text('Generate receipt'),
+                  style: FilledButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Add / edit a customer
+// ---------------------------------------------------------------------------
+class CustomerEditorPage extends StatefulWidget {
+  final BusinessProfile business;
+  final Customer? customer;
+  const CustomerEditorPage({super.key, required this.business, this.customer});
+
+  @override
+  State<CustomerEditorPage> createState() => _CustomerEditorPageState();
+}
+
+class _CustomerEditorPageState extends State<CustomerEditorPage> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _name;
+  late final TextEditingController _phone;
+  late final TextEditingController _package;
+  late final TextEditingController _amount;
+  late final TextEditingController _payment;
+  late final TextEditingController _nights;
+  late final TextEditingController _note;
+
+  @override
+  void initState() {
+    super.initState();
+    final c = widget.customer;
+    _name = TextEditingController(text: c?.name ?? '');
+    _phone = TextEditingController(text: c?.phone ?? '');
+    _package = TextEditingController(text: c?.package ?? '');
+    _amount = TextEditingController(
+        text: c == null ? '' : c.amount.toStringAsFixed(2));
+    _payment = TextEditingController(text: c?.payment ?? 'Deposit');
+    _nights = TextEditingController(text: '${c?.nights ?? 1}');
+    _note = TextEditingController(text: c?.note ?? '');
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_name, _phone, _package, _amount, _payment, _nights, _note]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    if (!_formKey.currentState!.validate()) return;
+    final c = widget.customer ??
+        Customer(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          businessId: widget.business.id,
+          name: '',
+        );
+    c.name = _name.text.trim();
+    c.phone = _phone.text.trim();
+    c.package = _package.text.trim();
+    c.amount = double.parse(_amount.text.trim());
+    c.payment = _payment.text.trim();
+    c.nights = int.parse(_nights.text.trim());
+    c.note = _note.text.trim();
+    await store.upsertCustomer(c);
+    if (mounted) Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(widget.customer == null ? 'Add customer' : 'Edit customer'),
+      ),
+      body: Form(
+        key: _formKey,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Text(
+              'For ${widget.business.name}',
+              style: const TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _name,
+              decoration: const InputDecoration(labelText: 'Name (Nama)'),
+              textCapitalization: TextCapitalization.characters,
+              validator: _req,
+            ),
+            const SizedBox(height: 10),
+            TextFormField(
+              controller: _phone,
+              decoration: const InputDecoration(labelText: 'Phone (optional)'),
+              keyboardType: TextInputType.phone,
+            ),
+            const SizedBox(height: 10),
+            TextFormField(
+              controller: _package,
+              decoration: const InputDecoration(labelText: 'Usual package (Pakej)'),
+              validator: _req,
+            ),
+            const SizedBox(height: 10),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: TextFormField(
+                    controller: _amount,
+                    decoration: const InputDecoration(
+                      labelText: 'Usual amount',
+                      prefixText: '$kCurrency ',
+                    ),
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    validator: _amountValidator,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextFormField(
+                    controller: _nights,
+                    decoration: const InputDecoration(
+                      labelText: 'Usual stay (nights)',
+                    ),
+                    keyboardType: TextInputType.number,
+                    validator: (v) {
+                      final n = int.tryParse((v ?? '').trim());
+                      return (n == null || n < 0) ? 'Invalid' : null;
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            TextFormField(
+              controller: _payment,
+              decoration: const InputDecoration(labelText: 'Usual payment (Bayaran)'),
+              validator: _req,
+            ),
+            const SizedBox(height: 6),
+            _PaymentChips(_payment),
+            const SizedBox(height: 10),
+            TextFormField(
+              controller: _note,
+              decoration: const InputDecoration(labelText: 'Note (optional)'),
+              maxLines: 2,
+            ),
+            const SizedBox(height: 24),
+            FilledButton.icon(
+              onPressed: _save,
+              icon: const Icon(Icons.save),
+              label: const Text('Save customer'),
+              style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 14)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ===========================================================================
 // BUSINESS PROFILES: list + editor
 // ===========================================================================
 class ProfilesPage extends StatelessWidget {
@@ -1262,7 +2141,8 @@ class ProfilesPage extends StatelessWidget {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Delete business?'),
-        content: Text('"${p.name}" will be removed from this device.'),
+        content: Text(
+            '"${p.name}" and its saved customers will be removed from this device.'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
